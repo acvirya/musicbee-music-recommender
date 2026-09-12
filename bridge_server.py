@@ -39,6 +39,8 @@ tracked_musicbee_pid = None
 watchdog_started = False
 last_player_mode = {}
 last_current_track = {}
+active_library_path = ""
+active_monitored_folders = []
 
 def format_ms(ms: int) -> str:
     """Formats milliseconds into mm:ss or hh:mm:ss string."""
@@ -202,6 +204,20 @@ class TelemetryHandler(http.server.BaseHTTPRequestHandler):
                 print(f"    - Skip Threshold : {', '.join(skip_desc)}")
                 print(f"    - Play Trigger   : {play_pct}% / {play_sec}s")
 
+            library = data.get("library", {})
+            if library:
+                active_library_path = library.get("library_path", "")
+                active_monitored_folders = library.get("monitored_folders", [])
+                print(f"  MusicBee Library Detected (Preferences -> Library):")
+                if active_library_path:
+                    print(f"    - Active Library Path : {active_library_path}")
+                if active_monitored_folders:
+                    print(f"    - Monitored Music Folders ({len(active_monitored_folders)}):")
+                    for idx, folder in enumerate(active_monitored_folders, 1):
+                        print(f"        {idx}. {folder}")
+                else:
+                    print(f"    - Monitored Music Folders : [None configured]")
+
         elif event_name == "TrackStarted":
             track = data.get("track", {})
             dur_ms = track.get("duration_ms", 0)
@@ -284,6 +300,16 @@ class TelemetryHandler(http.server.BaseHTTPRequestHandler):
             print("  MusicBee Preferences Updated by User!")
             print(f"    - New Skip Threshold : {', '.join(skip_desc)}")
             print(f"    - New Play Trigger   : {play_pct}% / {play_sec}s")
+
+            library = data.get("library", {})
+            if library:
+                active_library_path = library.get("library_path", active_library_path)
+                updated_folders = library.get("monitored_folders", [])
+                if updated_folders != active_monitored_folders:
+                    active_monitored_folders = updated_folders
+                    print(f"    - Updated Monitored Folders ({len(active_monitored_folders)}):")
+                    for idx, folder in enumerate(active_monitored_folders, 1):
+                        print(f"        {idx}. {folder}")
 
         elif event_name == "MusicBeeClosing":
             print("  MusicBee is closing cleanly.")

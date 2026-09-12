@@ -130,6 +130,156 @@ namespace MusicBeePlugin
             public bool Eligible => (Repeat != RepeatMode.One && !AutoDj);
         }
 
+        private class LibraryConfigInfo
+        {
+            public string LibraryPath = "";
+            public List<string> MonitoredFolders = new List<string>();
+        }
+
+        private List<string> lastMonitoredFolders = new List<string>();
+
+        private string ReadFileSafe(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return null;
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var sr = new StreamReader(fs, Encoding.UTF8))
+                {
+                    return sr.ReadToEnd();
+                }
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private LibraryConfigInfo GetLibraryConfig()
+        {
+            var config = new LibraryConfigInfo();
+            try
+            {
+                string storagePath = null;
+                try
+                {
+                    storagePath = mbApiInterface.Setting_GetPersistentStoragePath();
+                }
+                catch { }
+
+                if (string.IsNullOrEmpty(storagePath) || !Directory.Exists(storagePath))
+                {
+                    storagePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "MusicBee");
+                }
+
+                string appSettingsPath = Path.Combine(storagePath, "MusicBee3Settings.ini");
+                string libPath = null;
+
+                string appSettingsContent = ReadFileSafe(appSettingsPath);
+                if (!string.IsNullOrEmpty(appSettingsContent))
+                {
+                    var match = System.Text.RegularExpressions.Regex.Match(appSettingsContent, @"<ENV_LibPath>(.*?)</ENV_LibPath>");
+                    if (match.Success)
+                    {
+                        libPath = match.Groups[1].Value.Trim();
+                    }
+                }
+
+                if (string.IsNullOrEmpty(libPath) || !Directory.Exists(libPath))
+                {
+                    string defaultMusicBeeLib = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyMusic), "MusicBee");
+                    if (Directory.Exists(defaultMusicBeeLib))
+                    {
+                        libPath = defaultMusicBeeLib;
+                    }
+                    else
+                    {
+                        libPath = storagePath;
+                    }
+                }
+
+                config.LibraryPath = libPath;
+
+                string libSettingsPath = Path.Combine(libPath, "MusicBeeLibrarySettings.ini");
+                if (!File.Exists(libSettingsPath))
+                {
+                    libSettingsPath = Path.Combine(storagePath, "MusicBeeLibrarySettings.ini");
+                }
+
+                string libContent = ReadFileSafe(libSettingsPath);
+                if (!string.IsNullOrEmpty(libContent))
+                {
+                    var folderSectionMatch = System.Text.RegularExpressions.Regex.Match(
+                        libContent,
+                        @"<OrganisationMonitoredFolders>([\s\S]*?)</OrganisationMonitoredFolders>"
+                    );
+
+                    if (folderSectionMatch.Success)
+                    {
+                        var stringMatches = System.Text.RegularExpressions.Regex.Matches(
+                            folderSectionMatch.Groups[1].Value,
+                            @"<string>(.*?)</string>"
+                        );
+                        foreach (System.Text.RegularExpressions.Match sm in stringMatches)
+                        {
+                            string path = sm.Groups[1].Value.Trim();
+                            if (!string.IsNullOrEmpty(path) && !config.MonitoredFolders.Contains(path))
+                            {
+                                config.MonitoredFolders.Add(path);
+                            }
+                        }
+                    }
+
+                    // Fallback to MusicFromFolder if no monitored folders specified
+                    if (config.MonitoredFolders.Count == 0)
+                    {
+                        var musicFromMatch = System.Text.RegularExpressions.Regex.Match(libContent, @"<MusicFromFolder>(.*?)</MusicFromFolder>");
+                        if (musicFromMatch.Success)
+                        {
+                            string mf = musicFromMatch.Groups[1].Value.Trim();
+                            if (!string.IsNullOrEmpty(mf) && Directory.Exists(mf))
+                            {
+                                config.MonitoredFolders.Add(mf);
+                            }
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                mbApiInterface.MB_Trace($"MusicBeeRecommender: Error resolving library config: {ex.Message}");
+            }
+
+            return config;
+        }
+
+        private void SendStartupTelemetry()
+        {
+            try
+            {
+                int pid = Process.GetCurrentProcess().Id;
+                var libConfig = GetLibraryConfig();
+                lastMonitoredFolders = new List<string>(libConfig.MonitoredFolders);
+                string foldersJson = "[" + string.Join(",", libConfig.MonitoredFolders.Select(f => "\"" + EscapeJson(f) + "\"")) + "]";
+
+                string startupJson = string.Format(
+                    "{{\"event\":\"PluginStartup\",\"pid\":{0},\"settings\":{{\"skip_percent\":{1},\"skip_seconds\":{2},\"play_percent\":{3},\"play_seconds\":{4}}},\"library\":{{\"library_path\":\"{5}\",\"monitored_folders\":{6}}}}}",
+                    pid,
+                    skipTriggerPercent,
+                    skipTriggerSeconds,
+                    playTriggerPercent,
+                    playTriggerSeconds,
+                    EscapeJson(libConfig.LibraryPath),
+                    foldersJson
+                );
+                SendJsonTelemetry(startupJson);
+            }
+            catch (Exception ex)
+            {
+                mbApiInterface.MB_Trace($"MusicBeeRecommender: Error sending startup telemetry: {ex.Message}");
+            }
+        }
+
         public PluginInfo Initialise(IntPtr apiInterfacePtr)
         {
             Assembly thisAssem = typeof(Plugin).Assembly;
@@ -162,17 +312,8 @@ namespace MusicBeePlugin
             // Start position tracker timer (runs every 1 second to accurately measure listen time)
             positionTimer = new System.Threading.Timer(TrackPlaybackProgress, null, 1000, 1000);
 
-            // Notify bridge that plugin started and pass process ID + detected thresholds
-            int pid = Process.GetCurrentProcess().Id;
-            string startupJson = string.Format(
-                "{{\"event\":\"PluginStartup\",\"pid\":{0},\"settings\":{{\"skip_percent\":{1},\"skip_seconds\":{2},\"play_percent\":{3},\"play_seconds\":{4}}}}}",
-                pid,
-                skipTriggerPercent,
-                skipTriggerSeconds,
-                playTriggerPercent,
-                playTriggerSeconds
-            );
-            SendJsonTelemetry(startupJson);
+            // Send initial startup telemetry to bridge server
+            SendStartupTelemetry();
 
             return about;
         }
@@ -236,11 +377,19 @@ namespace MusicBeePlugin
         }
 
         private int settingsCheckCounter = 0;
+        private int reconnectAttemptCounter = 0;
+        private bool isConnectedToBridge = false;
 
         private void TrackPlaybackProgress(object state)
         {
             try
             {
+                // If not connected to bridge server, automatically retry sending PluginStartup every 2 seconds
+                if (!isConnectedToBridge && ++reconnectAttemptCounter % 2 == 0)
+                {
+                    SendStartupTelemetry();
+                }
+
                 // Check preferences every 2 seconds to catch changes in Tags (2) without waiting for track changes
                 if (++settingsCheckCounter % 2 == 0)
                 {
@@ -284,15 +433,28 @@ namespace MusicBeePlugin
                 // Reload user preferences from MusicBee
                 LoadMusicBeePreferences();
 
+                var currentLibConfig = GetLibraryConfig();
+                bool foldersChanged = !currentLibConfig.MonitoredFolders.SequenceEqual(lastMonitoredFolders);
+
                 if (oldSkipPct != skipTriggerPercent || oldSkipSec != skipTriggerSeconds ||
-                    oldPlayPct != playTriggerPercent || oldPlaySec != playTriggerSeconds)
+                    oldPlayPct != playTriggerPercent || oldPlaySec != playTriggerSeconds ||
+                    foldersChanged)
                 {
+                    if (foldersChanged)
+                    {
+                        lastMonitoredFolders = new List<string>(currentLibConfig.MonitoredFolders);
+                    }
+
+                    string foldersJson = "[" + string.Join(",", currentLibConfig.MonitoredFolders.Select(f => "\"" + EscapeJson(f) + "\"")) + "]";
+
                     string json = string.Format(
-                        "{{\"event\":\"SettingsChanged\",\"settings\":{{\"skip_percent\":{0},\"skip_seconds\":{1},\"play_percent\":{2},\"play_seconds\":{3}}}}}",
+                        "{{\"event\":\"SettingsChanged\",\"settings\":{{\"skip_percent\":{0},\"skip_seconds\":{1},\"play_percent\":{2},\"play_seconds\":{3}}},\"library\":{{\"library_path\":\"{4}\",\"monitored_folders\":{5}}}}}",
                         skipTriggerPercent,
                         skipTriggerSeconds,
                         playTriggerPercent,
-                        playTriggerSeconds
+                        playTriggerSeconds,
+                        EscapeJson(currentLibConfig.LibraryPath),
+                        foldersJson
                     );
                     SendJsonTelemetry(json);
                 }
@@ -345,6 +507,10 @@ namespace MusicBeePlugin
                     case NotificationType.PlayingTracksChanged:
                     case NotificationType.PlayingTracksQueueChanged:
                         ScheduleQueueUpdate();
+                        break;
+
+                    case NotificationType.LibrarySwitched:
+                        CheckAndUpdateSettings();
                         break;
                 }
             }
@@ -553,12 +719,18 @@ namespace MusicBeePlugin
                     HttpResponseMessage response = await httpClient.PostAsync(TELEMETRY_URL, content).ConfigureAwait(false);
                     if (response != null && response.IsSuccessStatusCode)
                     {
+                        isConnectedToBridge = true;
                         return await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    }
+                    else
+                    {
+                        isConnectedToBridge = false;
                     }
                 }
             }
             catch
             {
+                isConnectedToBridge = false;
                 // Bridge server not running or network timeout - silently fail
             }
             return null;
@@ -587,16 +759,29 @@ namespace MusicBeePlugin
             {
                 IntPtr hwnd = mbApiInterface.MB_GetWindowHandle();
                 Control parent = hwnd != IntPtr.Zero ? Control.FromHandle(hwnd) : null;
+                Action action = () =>
+                {
+                    mbApiInterface.NowPlayingList_QueueFilesLast(trackPaths);
+                    mbApiInterface.MB_SetBackgroundTaskMessage($"MusicBee Recommender: Added {trackPaths.Length} recommended tracks");
+
+                    // Clear message after 4 seconds
+                    var clearTimer = new System.Windows.Forms.Timer { Interval = 4000 };
+                    clearTimer.Tick += (s, e) =>
+                    {
+                        clearTimer.Stop();
+                        clearTimer.Dispose();
+                        mbApiInterface.MB_SetBackgroundTaskMessage("");
+                    };
+                    clearTimer.Start();
+                };
+
                 if (parent != null && parent.InvokeRequired)
                 {
-                    parent.BeginInvoke(new Action(() =>
-                    {
-                        mbApiInterface.NowPlayingList_QueueFilesLast(trackPaths);
-                    }));
+                    parent.BeginInvoke(action);
                 }
                 else
                 {
-                    mbApiInterface.NowPlayingList_QueueFilesLast(trackPaths);
+                    action();
                 }
             }
             catch (Exception ex)
