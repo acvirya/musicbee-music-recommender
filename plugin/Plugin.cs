@@ -1,12 +1,18 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Drawing;
 using System.IO;
 using System.Linq;
+using System.Net.Http;
 using System.Reflection;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using System.Windows.Forms;
 
 namespace YourNamespace
 {
-
     public sealed class LibraryEntryPoint
     {
         private static string DLLDirectory = "";
@@ -16,37 +22,23 @@ namespace YourNamespace
 
         public static string libraryDir { get; private set; } = "";
 
-        // This static constructor will be called when the DLL is loaded
         static LibraryEntryPoint()
         {
-            // Use a lock to ensure thread safety
             lock (initializationLock)
             {
                 if (!isInitialized)
                 {
-
 #if DEBUG
-                    // Force exceptions to be in English
                     System.Globalization.CultureInfo.DefaultThreadCurrentUICulture = System.Threading.Thread.CurrentThread.CurrentUICulture = System.Globalization.CultureInfo.InvariantCulture;
-#endif
-
-
                     Assembly thisAssem = typeof(LibraryEntryPoint).Assembly;
-#if DEBUG
-
                     Console.WriteLine($"Loaded {thisAssem.GetName().Name}");
 #endif
-
-                    // Setup DLL dependencies
-                    libraryDir = Path.GetDirectoryName(thisAssem.Location);
-
-                    string libDepFolder = Path.Combine(libraryDir, thisAssem.GetCustomAttribute<AssemblyTitleAttribute>().Title);
-
+                    Assembly assem = typeof(LibraryEntryPoint).Assembly;
+                    libraryDir = Path.GetDirectoryName(assem.Location);
+                    string libDepFolder = Path.Combine(libraryDir, assem.GetCustomAttribute<AssemblyTitleAttribute>().Title);
                     SetupDllDependencies(libDepFolder);
-
                 }
             }
-
             isInitialized = true;
         }
 
@@ -85,176 +77,386 @@ namespace YourNamespace
             return res;
         }
     }
-
 }
 
 namespace MusicBeePlugin
 {
-
-    using System.Drawing;
-    using System.Windows.Forms;
-
     using YourNamespace;
 
     public partial class Plugin
     {
-        // Required so entrypoint can be called
         static private LibraryEntryPoint entryPoint = new LibraryEntryPoint();
 
         private MusicBeeApiInterface mbApiInterface;
         private PluginInfo about = new PluginInfo();
 
+        // Telemetry tracking state
+        private string currentTrackUrl = null;
+        private int currentTrackDurationMs = 0;
+        private int lastObservedPositionMs = 0;
+        private System.Threading.Timer positionTimer = null;
+
+        // Debounce & deduplication controls for manual queue modifications
+        private System.Threading.Timer queueDebounceTimer = null;
+        private readonly object queueLock = new object();
+        private string lastReportedQueueSignature = "";
+
+        // HTTP client for forwarding telemetry to Python bridge server
+        private static readonly HttpClient httpClient = new HttpClient()
+        {
+            Timeout = TimeSpan.FromMilliseconds(1500)
+        };
+        private const string TELEMETRY_URL = "http://127.0.0.1:5005/event";
+
+        private class QueueSnapshot
+        {
+            public int TotalTracks;
+            public int CurrentIndex;
+            public List<string> UpcomingTracks = new List<string>();
+            public string Signature => $"{TotalTracks}:{CurrentIndex}:{(UpcomingTracks.Count > 0 ? UpcomingTracks[0] : "")}";
+        }
+
+        private class PlayerModeInfo
+        {
+            public RepeatMode Repeat;
+            public bool Shuffle;
+            public bool AutoDj;
+            public bool Eligible => (Repeat != RepeatMode.One && !AutoDj);
+        }
+
         public PluginInfo Initialise(IntPtr apiInterfacePtr)
         {
             Assembly thisAssem = typeof(Plugin).Assembly;
 
-            // Change these attributes in the .csproj
             string name = thisAssem.GetCustomAttribute<AssemblyTitleAttribute>().Title;
             Version ver = thisAssem.GetName().Version;
             string author = thisAssem.GetCustomAttribute<AssemblyCompanyAttribute>().Company;
             string description = thisAssem.GetCustomAttribute<AssemblyDescriptionAttribute>().Description;
 
-
             mbApiInterface = new MusicBeeApiInterface();
             mbApiInterface.Initialise(apiInterfacePtr);
+
             about.PluginInfoVersion = PluginInfoVersion;
             about.Name = name;
             about.Description = description;
             about.Author = author;
-            about.TargetApplication = "";   //  the name of a Plugin Storage device or panel header for a dockable panel
+            about.TargetApplication = "";
             about.Type = PluginType.General;
-            about.VersionMajor = (short)ver.Major;  // your plugin version
+            about.VersionMajor = (short)ver.Major;
             about.VersionMinor = (short)ver.Minor;
             about.Revision = (short)ver.Revision;
             about.MinInterfaceVersion = MinInterfaceVersion;
             about.MinApiRevision = MinApiRevision;
             about.ReceiveNotifications = (ReceiveNotificationFlags.PlayerEvents | ReceiveNotificationFlags.TagEvents);
-            about.ConfigurationPanelHeight = 0;   // height in pixels that musicbee should reserve in a panel for config settings. When set, a handle to an empty panel will be passed to the Configure function
+            about.ConfigurationPanelHeight = 0;
+
+            // Start position tracker timer (runs every 1 second to accurately measure listen time)
+            positionTimer = new System.Threading.Timer(TrackPlaybackProgress, null, 1000, 1000);
+
+            // Notify bridge that plugin started and pass process ID for watchdog tracking
+            int pid = Process.GetCurrentProcess().Id;
+            SendJsonTelemetry(string.Format("{{\"event\":\"PluginStartup\",\"pid\":{0}}}", pid));
 
             return about;
         }
 
+        private void TrackPlaybackProgress(object state)
+        {
+            try
+            {
+                if (mbApiInterface.Player_GetPlayState() == PlayState.Playing)
+                {
+                    int pos = mbApiInterface.Player_GetPosition();
+                    if (pos > 0)
+                    {
+                        lastObservedPositionMs = pos;
+                    }
+                }
+            }
+            catch
+            {
+                // Never throw on background timer
+            }
+        }
+
         public bool Configure(IntPtr panelHandle)
         {
-            // save any persistent settings in a sub-folder of this path
-            string dataPath = mbApiInterface.Setting_GetPersistentStoragePath();
-            // panelHandle will only be set if you set about.ConfigurationPanelHeight to a non-zero value
-            // keep in mind the panel width is scaled according to the font the user has selected
-            // if about.ConfigurationPanelHeight is set to 0, you can display your own popup window
-            if (panelHandle != IntPtr.Zero)
-            {
-                Panel configPanel = (Panel)Panel.FromHandle(panelHandle);
-                Label prompt = new Label();
-                prompt.AutoSize = true;
-                prompt.Location = new Point(0, 0);
-                prompt.Text = "prompt:";
-                TextBox textBox = new TextBox();
-                textBox.Bounds = new Rectangle(60, 0, 100, textBox.Height);
-                configPanel.Controls.AddRange(new Control[] { prompt, textBox });
-            }
             return false;
         }
-       
-        // called by MusicBee when the user clicks Apply or Save in the MusicBee Preferences screen.
-        // its up to you to figure out whether anything has changed and needs updating
+
         public void SaveSettings()
         {
-            // save any persistent settings in a sub-folder of this path
-            string dataPath = mbApiInterface.Setting_GetPersistentStoragePath();
         }
 
-        // MusicBee is closing the plugin (plugin is being disabled by user or MusicBee is shutting down)
         public void Close(PluginCloseReason reason)
         {
+            try
+            {
+                // Notify Python server of shutdown immediately
+                SendJsonTelemetry("{\"event\":\"MusicBeeClosing\"}");
+                Thread.Sleep(50);
+
+                positionTimer?.Dispose();
+                positionTimer = null;
+
+                lock (queueLock)
+                {
+                    queueDebounceTimer?.Dispose();
+                    queueDebounceTimer = null;
+                }
+            }
+            catch
+            {
+            }
         }
 
-        // uninstall this plugin - clean up any persisted files
         public void Uninstall()
         {
         }
 
-        // receive event notifications from MusicBee
-        // you need to set about.ReceiveNotificationFlags = PlayerEvents to receive all notifications, and not just the startup event
         public void ReceiveNotification(string sourceFileUrl, NotificationType type)
         {
-            // perform some action depending on the notification type
-            switch (type)
+            try
             {
-                case NotificationType.PluginStartup:
-                    // perform startup initialisation
-                    switch (mbApiInterface.Player_GetPlayState())
-                    {
-                        case PlayState.Playing:
-                        case PlayState.Paused:
-                            // ...
-                            break;
-                    }
-                    break;
-                case NotificationType.TrackChanged:
-                    string artist = mbApiInterface.NowPlaying_GetFileTag(MetaDataType.Artist);
-                    // ...
-                    break;
+                switch (type)
+                {
+                    case NotificationType.TrackChanged:
+                        HandleTrackChanged();
+                        break;
+
+                    case NotificationType.RatingChanged:
+                        HandleRatingChanged(sourceFileUrl);
+                        break;
+
+                    case NotificationType.PlayingTracksChanged:
+                    case NotificationType.PlayingTracksQueueChanged:
+                        ScheduleQueueUpdate();
+                        break;
+                }
+            }
+            catch (Exception ex)
+            {
+                mbApiInterface.MB_Trace($"MusicBeeRecommender Error in ReceiveNotification: {ex.Message}");
             }
         }
 
-        // return an array of lyric or artwork provider names this plugin supports
-        // the providers will be iterated through one by one and passed to the RetrieveLyrics/ RetrieveArtwork function in order set by the user in the MusicBee Tags(2) preferences screen until a match is found
-        //public string[] GetProviders()
-        //{
-        //    return null;
-        //}
+        private PlayerModeInfo GetPlayerModeInfo()
+        {
+            var info = new PlayerModeInfo();
+            try
+            {
+                info.Repeat = mbApiInterface.Player_GetRepeat();
+                info.Shuffle = mbApiInterface.Player_GetShuffle();
+                info.AutoDj = mbApiInterface.Player_GetAutoDjEnabled();
+            }
+            catch
+            {
+            }
+            return info;
+        }
 
-        // return lyrics for the requested artist/title from the requested provider
-        // only required if PluginType = LyricsRetrieval
-        // return null if no lyrics are found
-        //public string RetrieveLyrics(string sourceFileUrl, string artist, string trackTitle, string album, bool synchronisedPreferred, string provider)
-        //{
-        //    return null;
-        //}
+        private QueueSnapshot GetQueueSnapshot()
+        {
+            var snapshot = new QueueSnapshot();
+            try
+            {
+                string[] files = null;
+                bool success = mbApiInterface.NowPlayingList_QueryFilesEx(null, out files);
+                snapshot.CurrentIndex = mbApiInterface.NowPlayingList_GetCurrentIndex();
+                snapshot.TotalTracks = (success && files != null) ? files.Length : 0;
 
-        // return Base64 string representation of the artwork binary data from the requested provider
-        // only required if PluginType = ArtworkRetrieval
-        // return null if no artwork is found
-        //public string RetrieveArtwork(string sourceFileUrl, string albumArtist, string album, string provider)
-        //{
-        //    //Return Convert.ToBase64String(artworkBinaryData)
-        //    return null;
-        //}
+                if (files != null && snapshot.CurrentIndex >= 0 && snapshot.CurrentIndex < files.Length)
+                {
+                    for (int i = snapshot.CurrentIndex + 1; i < files.Length && snapshot.UpcomingTracks.Count < 10; i++)
+                    {
+                        snapshot.UpcomingTracks.Add(files[i]);
+                    }
+                }
+            }
+            catch
+            {
+            }
+            return snapshot;
+        }
 
-        //  presence of this function indicates to MusicBee that this plugin has a dockable panel. MusicBee will create the control and pass it as the panel parameter
-        //  you can add your own controls to the panel if needed
-        //  you can control the scrollable area of the panel using the mbApiInterface.MB_SetPanelScrollableArea function
-        //  to set a MusicBee header for the panel, set about.TargetApplication in the Initialise function above to the panel header text
-        //public int OnDockablePanelCreated(Control panel)
-        //{
-        //  //    return the height of the panel and perform any initialisation here
-        //  //    MusicBee will call panel.Dispose() when the user removes this panel from the layout configuration
-        //  //    < 0 indicates to MusicBee this control is resizable and should be sized to fill the panel it is docked to in MusicBee
-        //  //    = 0 indicates to MusicBee this control resizeable
-        //  //    > 0 indicates to MusicBee the fixed height for the control.Note it is recommended you scale the height for high DPI screens(create a graphics object and get the DpiY value)
-        //    float dpiScaling = 0;
-        //    using (Graphics g = panel.CreateGraphics())
-        //    {
-        //        dpiScaling = g.DpiY / 96f;
-        //    }
-        //    panel.Paint += panel_Paint;
-        //    return Convert.ToInt32(100 * dpiScaling);
-        //}
+        private void HandleTrackChanged()
+        {
+            string endedJson = null;
 
-        // presence of this function indicates to MusicBee that the dockable panel created above will show menu items when the panel header is clicked
-        // return the list of ToolStripMenuItems that will be displayed
-        //public List<ToolStripItem> GetHeaderMenuItems()
-        //{
-        //    List<ToolStripItem> list = new List<ToolStripItem>();
-        //    list.Add(new ToolStripMenuItem("A menu item"));
-        //    return list;
-        //}
+            // 1. Report completion or skip for previous track
+            if (!string.IsNullOrEmpty(currentTrackUrl))
+            {
+                int duration = currentTrackDurationMs;
+                int listened = lastObservedPositionMs;
+                // Considered skipped if played for < 80% of total duration and not within last 5 seconds
+                bool skipped = duration > 0 && listened < (int)(duration * 0.8) && listened < Math.Max(0, duration - 5000);
 
-        //private void panel_Paint(object sender, PaintEventArgs e)
-        //{
-        //    e.Graphics.Clear(Color.Red);
-        //    TextRenderer.DrawText(e.Graphics, "hello", SystemFonts.CaptionFont, new Point(10, 10), Color.Blue);
-        //}
+                endedJson = string.Format(
+                    "{{\"event\":\"TrackEnded\",\"track\":{{\"path\":\"{0}\",\"duration_ms\":{1},\"listened_ms\":{2},\"skipped\":{3}}}}}",
+                    EscapeJson(currentTrackUrl),
+                    duration,
+                    listened,
+                    skipped ? "true" : "false"
+                );
+            }
 
+            // 2. Register newly playing track
+            currentTrackUrl = mbApiInterface.NowPlaying_GetFileUrl();
+            currentTrackDurationMs = mbApiInterface.NowPlaying_GetDuration();
+            lastObservedPositionMs = 0;
+
+            string startedJson = null;
+            if (!string.IsNullOrEmpty(currentTrackUrl))
+            {
+                PlayerModeInfo mode = GetPlayerModeInfo();
+                QueueSnapshot queue = GetQueueSnapshot();
+                lastReportedQueueSignature = queue.Signature; // Mark queue as reported to eliminate duplicate QueueChanged
+
+                startedJson = string.Format(
+                    "{{\"event\":\"TrackStarted\",\"track\":{{\"path\":\"{0}\",\"duration_ms\":{1}}},\"player_mode\":{2},\"queue\":{3}}}",
+                    EscapeJson(currentTrackUrl),
+                    currentTrackDurationMs,
+                    FormatPlayerModeJson(mode),
+                    FormatQueueJson(queue)
+                );
+            }
+
+            // Send sequentially: TrackEnded ALWAYS precedes TrackStarted
+            Task.Run(async () =>
+            {
+                if (endedJson != null)
+                {
+                    await PostJsonAsync(endedJson).ConfigureAwait(false);
+                }
+                if (startedJson != null)
+                {
+                    await PostJsonAsync(startedJson).ConfigureAwait(false);
+                }
+            });
+        }
+
+        private void HandleRatingChanged(string sourceFileUrl)
+        {
+            string targetUrl = string.IsNullOrEmpty(sourceFileUrl) ? mbApiInterface.NowPlaying_GetFileUrl() : sourceFileUrl;
+            if (string.IsNullOrEmpty(targetUrl)) return;
+
+            string rating = mbApiInterface.Library_GetFileTag(targetUrl, MetaDataType.Rating);
+            string love = mbApiInterface.Library_GetFileTag(targetUrl, MetaDataType.RatingLove);
+
+            string json = string.Format(
+                "{{\"event\":\"RatingChanged\",\"path\":\"{0}\",\"rating\":\"{1}\",\"love\":\"{2}\"}}",
+                EscapeJson(targetUrl),
+                EscapeJson(rating ?? ""),
+                EscapeJson(love ?? "")
+            );
+            SendJsonTelemetry(json);
+        }
+
+        private void ScheduleQueueUpdate()
+        {
+            // Debounce queue notifications by 300ms to swallow rapid multi-event bursts
+            lock (queueLock)
+            {
+                queueDebounceTimer?.Dispose();
+                queueDebounceTimer = new System.Threading.Timer(_ => HandleQueueChanged(), null, 300, Timeout.Infinite);
+            }
+        }
+
+        private void HandleQueueChanged()
+        {
+            try
+            {
+                QueueSnapshot queue = GetQueueSnapshot();
+
+                // Deduplicate: avoid sending if queue state hasn't meaningfully changed
+                if (queue.Signature == lastReportedQueueSignature)
+                {
+                    return;
+                }
+                lastReportedQueueSignature = queue.Signature;
+
+                string json = string.Format(
+                    "{{\"event\":\"QueueChanged\",\"total_tracks\":{0},\"current_index\":{1},\"upcoming_tracks\":{2}}}",
+                    queue.TotalTracks,
+                    queue.CurrentIndex,
+                    FormatUpcomingTracksJson(queue.UpcomingTracks)
+                );
+
+                SendJsonTelemetry(json);
+            }
+            catch (Exception ex)
+            {
+                mbApiInterface.MB_Trace($"MusicBeeRecommender Error in HandleQueueChanged: {ex.Message}");
+            }
+        }
+
+        private string FormatPlayerModeJson(PlayerModeInfo mode)
+        {
+            return string.Format(
+                "{{\"repeat\":\"{0}\",\"shuffle\":{1},\"auto_dj\":{2},\"eligible\":{3}}}",
+                mode.Repeat.ToString(),
+                mode.Shuffle ? "true" : "false",
+                mode.AutoDj ? "true" : "false",
+                mode.Eligible ? "true" : "false"
+            );
+        }
+
+        private string FormatQueueJson(QueueSnapshot queue)
+        {
+            return string.Format(
+                "{{\"total_tracks\":{0},\"current_index\":{1},\"upcoming_tracks\":{2}}}",
+                queue.TotalTracks,
+                queue.CurrentIndex,
+                FormatUpcomingTracksJson(queue.UpcomingTracks)
+            );
+        }
+
+        private string FormatUpcomingTracksJson(List<string> tracks)
+        {
+            StringBuilder sb = new StringBuilder();
+            sb.Append("[");
+            for (int i = 0; i < tracks.Count; i++)
+            {
+                if (i > 0) sb.Append(",");
+                sb.AppendFormat("\"{0}\"", EscapeJson(tracks[i]));
+            }
+            sb.Append("]");
+            return sb.ToString();
+        }
+
+        private async Task PostJsonAsync(string jsonPayload)
+        {
+            try
+            {
+                using (StringContent content = new StringContent(jsonPayload, Encoding.UTF8, "application/json"))
+                {
+                    await httpClient.PostAsync(TELEMETRY_URL, content).ConfigureAwait(false);
+                }
+            }
+            catch
+            {
+                // Bridge server not running or network timeout - silently fail
+            }
+        }
+
+        private void SendJsonTelemetry(string jsonPayload)
+        {
+            // Fire-and-forget asynchronous POST to ensure zero stutter on MusicBee main thread
+            Task.Run(async () =>
+            {
+                await PostJsonAsync(jsonPayload).ConfigureAwait(false);
+            });
+        }
+
+        private static string EscapeJson(string str)
+        {
+            if (string.IsNullOrEmpty(str)) return "";
+            return str
+                .Replace("\\", "\\\\")
+                .Replace("\"", "\\\"")
+                .Replace("\r", "\\r")
+                .Replace("\n", "\\n")
+                .Replace("\t", "\\t");
+        }
     }
 }
