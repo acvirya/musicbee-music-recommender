@@ -1,13 +1,14 @@
 """
 MusicBee Telemetry Bridge Server
 Receives playback, rating, player mode, and queue events from the MusicBee Recommender plugin
-and displays them in real time in the console.
+and returns recommended tracks in the HTTP response to be queued in MusicBee.
 
 Features:
 - Real-time event formatted logging
 - Integrated player mode & queue snapshot inside TrackStarted
 - Watermark Buffer evaluation (Recommender trigger detection)
 - Auto-close watchdog: terminates bridge server when MusicBee closes or crashes
+- HTTP response recommendation delivery: auto-queues tracks into MusicBee
 """
 
 import ctypes
@@ -26,6 +27,12 @@ PORT = 5005
 # Watermark buffer threshold:
 # If 1 or fewer upcoming tracks remain in the queue, trigger recommender
 BUFFER_THRESHOLD = 1
+
+# Mock recommended tracks requested by the user
+MOCK_RECOMMENDATIONS = [
+    r"D:\Music\MusicBee\Music\ハミダシクリエイティブ凸 ボーカルアルバム\02 Heart Creation.flac",
+    r"D:\Music\MusicBee\Music\ハミダシクリエイティブ凸 ボーカルアルバム\06 夏色カメラロール.flac",
+]
 
 # Global state tracking
 tracked_musicbee_pid = None
@@ -80,11 +87,13 @@ def start_watchdog():
     t = threading.Thread(target=run_watchdog, daemon=True)
     t.start()
 
-def evaluate_recommender(track: dict, mode: dict, queue: dict):
+def evaluate_recommender(track: dict, mode: dict, queue: dict) -> list:
     """
     Evaluates whether the Recommendation Engine should trigger based on:
     1. Player Mode eligibility (Repeat != One and AutoDJ == False)
     2. Queue Watermark Buffer (remaining tracks <= BUFFER_THRESHOLD)
+
+    Returns a list of track paths to queue if triggered, or None/empty if idle.
     """
     eligible = mode.get("eligible", False)
     rep = mode.get("repeat", "None")
@@ -106,6 +115,7 @@ def evaluate_recommender(track: dict, mode: dict, queue: dict):
             reasons.append("Auto DJ is ON (MusicBee manages queue)")
         print(f"  Status    : [IDLE / PAUSED]")
         print(f"  Reason    : Ineligible mode ({', '.join(reasons)})")
+        return []
 
     elif remaining <= BUFFER_THRESHOLD:
         song_name = track.get("path", "Unknown").replace("\\", "/").split("/")[-1]
@@ -113,12 +123,17 @@ def evaluate_recommender(track: dict, mode: dict, queue: dict):
         print(f"  Condition : Queue low! ({remaining} upcoming track(s) <= threshold of {BUFFER_THRESHOLD})")
         print(f"  Message   : Recommendation Engine Triggered! Fetching Recommended Tracks...")
         print(f"  Seed Track: \"{song_name}\"")
-        print(f"  Action    : [Mock] Queried section embeddings -> 2 recommended songs queued to end.")
+        print(f"  Action    : Sending {len(MOCK_RECOMMENDATIONS)} mock recommended tracks to MusicBee queue:")
+        for idx, p in enumerate(MOCK_RECOMMENDATIONS, 1):
+            fn = p.replace("\\", "/").split("/")[-1]
+            print(f"              {idx}. {fn}")
+        return MOCK_RECOMMENDATIONS
 
     else:
         print(f"  Status    : [IDLE]")
         print(f"  Condition : Queue healthy ({remaining} upcoming tracks > threshold of {BUFFER_THRESHOLD})")
         print(f"  Reason    : User queue has plenty of songs. Respecting user playlist without intrusion.")
+        return []
 
 class TelemetryHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self):
@@ -129,14 +144,16 @@ class TelemetryHandler(http.server.BaseHTTPRequestHandler):
             try:
                 data = json.loads(body.decode("utf-8"))
                 
-                # Send HTTP 200 response first
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.end_headers()
-                self.wfile.write(b'{"status":"ok"}')
+                # Process the event and prepare response payload
+                response_payload = self.handle_telemetry_event(data)
                 
-                # Process the event
-                self.handle_telemetry_event(data)
+                # Send HTTP 200 response with pure UTF-8 JSON
+                response_bytes = json.dumps(response_payload, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(response_bytes)))
+                self.end_headers()
+                self.wfile.write(response_bytes)
             except Exception as e:
                 print(f"[ERROR] Failed to process incoming event: {e}")
                 self.send_response(400)
@@ -146,7 +163,7 @@ class TelemetryHandler(http.server.BaseHTTPRequestHandler):
             self.send_response(404)
             self.end_headers()
 
-    def handle_telemetry_event(self, data: dict):
+    def handle_telemetry_event(self, data: dict) -> dict:
         global tracked_musicbee_pid, last_player_mode, last_current_track
         event_name = data.get("event", "UNKNOWN")
         time_str = datetime.now().strftime("%H:%M:%S")
@@ -155,6 +172,8 @@ class TelemetryHandler(http.server.BaseHTTPRequestHandler):
         print(f"\n{separator}")
         print(f"[{time_str}] EVENT: {event_name}")
         print(separator)
+
+        response_payload = {"status": "ok"}
 
         if event_name == "PluginStartup":
             pid = data.get("pid")
@@ -214,7 +233,10 @@ class TelemetryHandler(http.server.BaseHTTPRequestHandler):
                         print(f"    {i}. {filename}")
 
             # Evaluate recommender activation
-            evaluate_recommender(track, mode, queue)
+            recommendations = evaluate_recommender(track, mode, queue)
+            if recommendations:
+                response_payload["action"] = "queue_tracks"
+                response_payload["tracks"] = recommendations
             
         elif event_name == "TrackEnded":
             track = data.get("track", {})
@@ -238,7 +260,7 @@ class TelemetryHandler(http.server.BaseHTTPRequestHandler):
             curr_idx = data.get("current_index", -1)
             upcoming = data.get("upcoming_tracks", [])
             remaining = max(0, total - (curr_idx + 1)) if (total > 0 and curr_idx >= 0) else 0
-            print(f"  [Manual Queue Edit]")
+            print(f"  [Queue Snapshot Updated]")
             print(f"  Queue      : Playing {curr_idx + 1} of {total} (Remaining in queue: {remaining})")
             if upcoming:
                 print(f"  Upcoming ({len(upcoming)} tracks shown):")
@@ -246,7 +268,6 @@ class TelemetryHandler(http.server.BaseHTTPRequestHandler):
                     filename = path.replace("\\", "/").split("/")[-1]
                     print(f"    {i}. {filename}")
 
-            # Evaluate recommender activation on queue changes as well
         elif event_name == "SettingsChanged":
             settings = data.get("settings", {})
             skip_pct = settings.get("skip_percent", 0)
@@ -274,6 +295,7 @@ class TelemetryHandler(http.server.BaseHTTPRequestHandler):
             print(f"  Raw Payload: {json.dumps(data, indent=2)}")
 
         sys.stdout.flush()
+        return response_payload
 
     def log_message(self, format, *args):
         # Suppress default HTTP logging to keep console clean

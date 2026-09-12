@@ -446,7 +446,11 @@ namespace MusicBeePlugin
                 }
                 if (startedJson != null)
                 {
-                    await PostJsonAsync(startedJson).ConfigureAwait(false);
+                    string responseJson = await PostJsonAsync(startedJson).ConfigureAwait(false);
+                    if (!string.IsNullOrEmpty(responseJson))
+                    {
+                        ProcessServerResponse(responseJson);
+                    }
                 }
             });
         }
@@ -540,19 +544,102 @@ namespace MusicBeePlugin
             return sb.ToString();
         }
 
-        private async Task PostJsonAsync(string jsonPayload)
+        private async Task<string> PostJsonAsync(string jsonPayload)
         {
             try
             {
                 using (StringContent content = new StringContent(jsonPayload, Encoding.UTF8, "application/json"))
                 {
-                    await httpClient.PostAsync(TELEMETRY_URL, content).ConfigureAwait(false);
+                    HttpResponseMessage response = await httpClient.PostAsync(TELEMETRY_URL, content).ConfigureAwait(false);
+                    if (response != null && response.IsSuccessStatusCode)
+                    {
+                        return await response.Content.ReadAsStringAsync().ConfigureAwait(false);
+                    }
                 }
             }
             catch
             {
                 // Bridge server not running or network timeout - silently fail
             }
+            return null;
+        }
+
+        private void ProcessServerResponse(string responseJson)
+        {
+            try
+            {
+                List<string> tracksToQueue = ParseTracksFromJson(responseJson);
+                if (tracksToQueue.Count > 0)
+                {
+                    QueueRecommendedTracks(tracksToQueue.ToArray());
+                }
+            }
+            catch (Exception ex)
+            {
+                mbApiInterface.MB_Trace($"MusicBeeRecommender: Error processing server response: {ex.Message}");
+            }
+        }
+
+        private void QueueRecommendedTracks(string[] trackPaths)
+        {
+            if (trackPaths == null || trackPaths.Length == 0) return;
+            try
+            {
+                IntPtr hwnd = mbApiInterface.MB_GetWindowHandle();
+                Control parent = hwnd != IntPtr.Zero ? Control.FromHandle(hwnd) : null;
+                if (parent != null && parent.InvokeRequired)
+                {
+                    parent.BeginInvoke(new Action(() =>
+                    {
+                        mbApiInterface.NowPlayingList_QueueFilesLast(trackPaths);
+                    }));
+                }
+                else
+                {
+                    mbApiInterface.NowPlayingList_QueueFilesLast(trackPaths);
+                }
+            }
+            catch (Exception ex)
+            {
+                mbApiInterface.MB_Trace($"MusicBeeRecommender: Failed to queue tracks: {ex.Message}");
+            }
+        }
+
+        private List<string> ParseTracksFromJson(string json)
+        {
+            var tracks = new List<string>();
+            try
+            {
+                int tracksIdx = json.IndexOf("\"tracks\"");
+                if (tracksIdx < 0) return tracks;
+
+                int start = json.IndexOf('[', tracksIdx);
+                int end = json.IndexOf(']', start);
+                if (start >= 0 && end > start)
+                {
+                    string content = json.Substring(start + 1, end - start - 1);
+                    var matches = System.Text.RegularExpressions.Regex.Matches(content, "\"((?:\\\\\"|[^\"])*)\"");
+                    foreach (System.Text.RegularExpressions.Match m in matches)
+                    {
+                        string raw = m.Groups[1].Value;
+                        string path;
+                        try
+                        {
+                            path = System.Text.RegularExpressions.Regex.Unescape(raw);
+                        }
+                        catch
+                        {
+                            path = raw.Replace("\\\\", "\\").Replace("\\\"", "\"");
+                        }
+                        if (!string.IsNullOrEmpty(path))
+                        {
+                            tracks.Add(path);
+                        }
+                    }
+                }
+            }
+            catch { }
+            return tracks;
         }
 
         private void SendJsonTelemetry(string jsonPayload)
