@@ -90,6 +90,12 @@ namespace MusicBeePlugin
         private MusicBeeApiInterface mbApiInterface;
         private PluginInfo about = new PluginInfo();
 
+        // MusicBee user-configured preferences for play / skip triggers
+        private int skipTriggerPercent = 0;
+        private int skipTriggerSeconds = 0;
+        private int playTriggerPercent = 0;
+        private int playTriggerSeconds = 0;
+
         // Telemetry tracking state
         private string currentTrackUrl = null;
         private int currentTrackDurationMs = 0;
@@ -150,20 +156,97 @@ namespace MusicBeePlugin
             about.ReceiveNotifications = (ReceiveNotificationFlags.PlayerEvents | ReceiveNotificationFlags.TagEvents);
             about.ConfigurationPanelHeight = 0;
 
+            // Load user preferences for skip & play thresholds from MusicBee
+            LoadMusicBeePreferences();
+
             // Start position tracker timer (runs every 1 second to accurately measure listen time)
             positionTimer = new System.Threading.Timer(TrackPlaybackProgress, null, 1000, 1000);
 
-            // Notify bridge that plugin started and pass process ID for watchdog tracking
+            // Notify bridge that plugin started and pass process ID + detected thresholds
             int pid = Process.GetCurrentProcess().Id;
-            SendJsonTelemetry(string.Format("{{\"event\":\"PluginStartup\",\"pid\":{0}}}", pid));
+            string startupJson = string.Format(
+                "{{\"event\":\"PluginStartup\",\"pid\":{0},\"settings\":{{\"skip_percent\":{1},\"skip_seconds\":{2},\"play_percent\":{3},\"play_seconds\":{4}}}}}",
+                pid,
+                skipTriggerPercent,
+                skipTriggerSeconds,
+                playTriggerPercent,
+                playTriggerSeconds
+            );
+            SendJsonTelemetry(startupJson);
 
             return about;
         }
+
+        private void LoadMusicBeePreferences()
+        {
+            try
+            {
+                object val;
+                if (mbApiInterface.Setting_GetValue(SettingId.SkipCountTriggerPercent, out val) && val != null)
+                {
+                    int.TryParse(val.ToString(), out skipTriggerPercent);
+                }
+                if (mbApiInterface.Setting_GetValue(SettingId.SkipCountTriggerSeconds, out val) && val != null)
+                {
+                    int.TryParse(val.ToString(), out skipTriggerSeconds);
+                }
+                if (mbApiInterface.Setting_GetValue(SettingId.PlayCountTriggerPercent, out val) && val != null)
+                {
+                    int.TryParse(val.ToString(), out playTriggerPercent);
+                }
+                if (mbApiInterface.Setting_GetValue(SettingId.PlayCountTriggerSeconds, out val) && val != null)
+                {
+                    int.TryParse(val.ToString(), out playTriggerSeconds);
+                }
+            }
+            catch (Exception ex)
+            {
+                mbApiInterface.MB_Trace($"MusicBeeRecommender: Unable to load settings: {ex.Message}");
+            }
+        }
+
+        private bool DetermineSkippedStatus(int durationMs, int listenedMs)
+        {
+            if (durationMs <= 0) return false;
+            int listenedSec = listenedMs / 1000;
+            double listenedPct = (listenedMs / (double)durationMs) * 100.0;
+
+            // 1. Check MusicBee Skip Count Trigger (if configured in user preferences)
+            if (skipTriggerPercent > 0)
+            {
+                return listenedPct < skipTriggerPercent;
+            }
+            if (skipTriggerSeconds > 0)
+            {
+                return listenedSec < skipTriggerSeconds;
+            }
+
+            // 2. Check MusicBee Play Count Trigger (if played enough to increment play count, it wasn't skipped)
+            if (playTriggerPercent > 0)
+            {
+                return listenedPct < playTriggerPercent;
+            }
+            if (playTriggerSeconds > 0)
+            {
+                return listenedSec < playTriggerSeconds;
+            }
+
+            // 3. Fallback default: considered skipped if played for < 80% and not within the last 5 seconds
+            return listenedPct < 80.0 && listenedMs < Math.Max(0, durationMs - 5000);
+        }
+
+        private int settingsCheckCounter = 0;
 
         private void TrackPlaybackProgress(object state)
         {
             try
             {
+                // Check preferences every 2 seconds to catch changes in Tags (2) without waiting for track changes
+                if (++settingsCheckCounter % 2 == 0)
+                {
+                    CheckAndUpdateSettings();
+                }
+
                 if (mbApiInterface.Player_GetPlayState() == PlayState.Playing)
                 {
                     int pos = mbApiInterface.Player_GetPosition();
@@ -186,6 +269,37 @@ namespace MusicBeePlugin
 
         public void SaveSettings()
         {
+            CheckAndUpdateSettings();
+        }
+
+        private void CheckAndUpdateSettings()
+        {
+            try
+            {
+                int oldSkipPct = skipTriggerPercent;
+                int oldSkipSec = skipTriggerSeconds;
+                int oldPlayPct = playTriggerPercent;
+                int oldPlaySec = playTriggerSeconds;
+
+                // Reload user preferences from MusicBee
+                LoadMusicBeePreferences();
+
+                if (oldSkipPct != skipTriggerPercent || oldSkipSec != skipTriggerSeconds ||
+                    oldPlayPct != playTriggerPercent || oldPlaySec != playTriggerSeconds)
+                {
+                    string json = string.Format(
+                        "{{\"event\":\"SettingsChanged\",\"settings\":{{\"skip_percent\":{0},\"skip_seconds\":{1},\"play_percent\":{2},\"play_seconds\":{3}}}}}",
+                        skipTriggerPercent,
+                        skipTriggerSeconds,
+                        playTriggerPercent,
+                        playTriggerSeconds
+                    );
+                    SendJsonTelemetry(json);
+                }
+            }
+            catch
+            {
+            }
         }
 
         public void Close(PluginCloseReason reason)
@@ -281,15 +395,17 @@ namespace MusicBeePlugin
 
         private void HandleTrackChanged()
         {
+            // Ensure settings are fresh
+            CheckAndUpdateSettings();
+
             string endedJson = null;
 
-            // 1. Report completion or skip for previous track
+            // 1. Report completion or skip for previous track using MusicBee's actual skip thresholds
             if (!string.IsNullOrEmpty(currentTrackUrl))
             {
                 int duration = currentTrackDurationMs;
                 int listened = lastObservedPositionMs;
-                // Considered skipped if played for < 80% of total duration and not within last 5 seconds
-                bool skipped = duration > 0 && listened < (int)(duration * 0.8) && listened < Math.Max(0, duration - 5000);
+                bool skipped = DetermineSkippedStatus(duration, listened);
 
                 endedJson = string.Format(
                     "{{\"event\":\"TrackEnded\",\"track\":{{\"path\":\"{0}\",\"duration_ms\":{1},\"listened_ms\":{2},\"skipped\":{3}}}}}",
